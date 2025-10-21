@@ -26,7 +26,7 @@ permissions:
   contents: read
 
 env:
-  ORG: iwashitahga                # 組織のログイン名に置き換え
+  OWNER_LOGIN: iwashitahga                # 組織のログイン名に置き換え
   PARENT_PROJECT_NUMBER: "1"        # 親プロジェクト番号に置き換え
   CHILD_PROJECT_NUMBERS: "2"     # 子プロジェクト番号（カンマ区切り）に置き換え
 
@@ -44,7 +44,7 @@ env:
   GH_TOKEN: ${{ secrets.ORG_PROJECTS_TOKEN }}
   AUTO_ADD: ${{ github.event.inputs.auto_add }}
 
-jobs:
+obs:
   sync:
     runs-on: ubuntu-latest
     steps:
@@ -53,7 +53,7 @@ jobs:
         with:
           github-token: ${{ env.GH_TOKEN }}
           script: |
-            const ORG = process.env.ORG;
+            const OWNER = process.env.OWNER_LOGIN;
             const PARENT_NUM = parseInt(process.env.PARENT_PROJECT_NUMBER, 10);
             const CHILD_NUMS = process.env.CHILD_PROJECT_NUMBERS.split(",").map(s=>parseInt(s.trim(),10));
             const FIELD_STATUS = process.env.FIELD_STATUS;
@@ -68,17 +68,75 @@ jobs:
             const FILTER_MODE = (process.env.FILTER_MODE || "OR").toUpperCase(); // OR / AND
             const AUTO_ADD = (process.env.AUTO_ADD || 'false') === 'true';
 
-            core.info(`Filter: labels=[${FILTER_LABELS.join(", ")}], featureField="${FEATURE_FIELD_NAME}"(single-select), featureValues=[${FEATURE_VALUES.join(", ")}], mode=${FILTER_MODE}`);
-
             function toSet(arr){ return new Set(arr || []); }
             const labelSet = toSet(FILTER_LABELS);
             const featureSet = toSet(FEATURE_VALUES);
 
-            // Query helper
-            async function getProject(org, number) {
+            core.info(`Owner=${OWNER} | Filter labels=[${FILTER_LABELS.join(", ")}], featureField="${FEATURE_FIELD_NAME}", featureValues=[${FEATURE_VALUES.join(", ")}], mode=${FILTER_MODE}`);
+
+            // 共通クエリ（user/organization の両方を投げ、存在する方を採用）
+            async function getProject(ownerLogin, number) {
               const q = `
-              query($org:String!,$number:Int!,$after:String) {
-                organization(login:$org){
+              query($login:String!,$number:Int!,$after:String) {
+                user(login:$login) {
+                  projectV2(number:$number){
+                    id
+                    title
+                    fields(first:100){
+                      nodes{
+                        __typename
+                        ... on ProjectV2FieldCommon {
+                          id
+                          name
+                        }
+                        ... on ProjectV2SingleSelectField {
+                          options { id name }
+                        }
+                      }
+                    }
+                    items(first:100, after:$after){
+                      pageInfo{ hasNextPage endCursor }
+                      nodes{
+                        id
+                        content{
+                          __typename
+                          ... on Issue {
+                            id
+                            number
+                            repository { nameWithOwner }
+                            labels(first:100){ nodes{ name } }
+                          }
+                          ... on PullRequest {
+                            id
+                            number
+                            repository { nameWithOwner }
+                            labels(first:100){ nodes{ name } }
+                          }
+                        }
+                        fieldValues(first:50){
+                          nodes{
+                            __typename
+                            ... on ProjectV2ItemFieldSingleSelectValue{
+                              field{
+                                __typename
+                                ... on ProjectV2FieldCommon { id name }
+                              }
+                              name
+                            }
+                            ... on ProjectV2ItemFieldDateValue{
+                              field{
+                                __typename
+                                ... on ProjectV2FieldCommon { id name }
+                              }
+                              date
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+                organization(login:$login) {
                   projectV2(number:$number){
                     id
                     title
@@ -137,12 +195,20 @@ jobs:
                   }
                 }
               }`;
+
               let items = [];
               let after = null;
-              let project, fields;
+              let project = null;
+              let fields = [];
+
               do {
-                const res = await github.graphql(q, { org, number, after });
-                project = res.organization.projectV2;
+                const res = await github.graphql(q, { login: ownerLogin, number, after });
+                const userProj = res.user?.projectV2 || null;
+                const orgProj  = res.organization?.projectV2 || null;
+                project = userProj || orgProj;
+                if (!project) {
+                  throw new Error(`ProjectV2 not found for ${ownerLogin} #${number}`);
+                }
                 fields = project.fields.nodes;
                 items.push(...project.items.nodes);
                 after = project.items.pageInfo.hasNextPage ? project.items.pageInfo.endCursor : null;
@@ -164,14 +230,14 @@ jobs:
                 const contentId = it.content.id;
                 itemByContentId[contentId] = { itemId: it.id, content: it.content };
 
-                // Collect labels from Issue/PR
+                // Labels
                 let labelNames = [];
                 if (it.content.__typename === 'Issue' || it.content.__typename === 'PullRequest') {
                   labelNames = (it.content.labels?.nodes || []).map(n => n.name).filter(Boolean);
                 }
                 labelsByContentId[contentId] = labelNames;
 
-                // Collect field values we care about
+                // Field values to read
                 const v = {};
                 for (const fv of it.fieldValues.nodes || []) {
                   if (fv.__typename === 'ProjectV2ItemFieldSingleSelectValue') {
@@ -248,7 +314,7 @@ jobs:
             }
 
             // Load parent
-            const parent = await getProject(ORG, PARENT_NUM);
+            const parent = await getProject(OWNER, PARENT_NUM);
             core.info(`Parent: ${parent.title}`);
 
             const parentStatusField = parent.fieldByName[FIELD_STATUS];
@@ -261,13 +327,11 @@ jobs:
             if (!parentEndField) core.warning(`Parent field not found: ${FIELD_END}`);
             if (!parentFeatureField) {
               core.warning(`Parent field not found: ${FEATURE_FIELD_NAME}`);
-            } else if (parentFeatureField.__typename !== 'ProjectV2SingleSelectField') {
-              core.warning(`Parent field "${FEATURE_FIELD_NAME}" is not Single-select (typename=${parentFeatureField.__typename}).`);
             }
 
             // Sync to children
             for (const childNum of CHILD_NUMS) {
-              const child = await getProject(ORG, childNum);
+              const child = await getProject(OWNER, childNum);
               core.info(`Child: ${child.title}`);
 
               const childStatusField = child.fieldByName[FIELD_STATUS];
@@ -278,7 +342,7 @@ jobs:
                 core.warning(`Child ${child.title}: Missing fields. Status:${!!childStatusField} startDate:${!!childStartField} endDate:${!!childEndField}`);
               }
 
-              // map child status options
+              // Map child Status options (name -> optionId)
               const childStatusOptions = {};
               if (childStatusField?.options) {
                 for (const opt of childStatusField.options) childStatusOptions[opt.name] = opt.id;

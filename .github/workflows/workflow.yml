@@ -41,6 +41,10 @@ env:
   FEATURE_VALUES: "五輪"        # 機能名フィールドの許容値（カンマ区切り、空なら無効）
   FILTER_MODE: "OR"                  # OR（どちらか一致）/ AND（両方一致）
 
+  # ログ制御
+  LOG_MODE: "filtered"               # off | filtered | matched | all
+  LOG_LIMIT: "200"                   # ログ行数上限
+
   GH_TOKEN: ${{ secrets.ORG_PROJECTS_TOKEN }}
   AUTO_ADD: ${{ github.event.inputs.auto_add }}
 
@@ -48,7 +52,7 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Sync parent -> children (filtered)
+      - name: Sync parent -> children (filtered, with logging)
         uses: actions/github-script@v7
         with:
           github-token: ${{ env.GH_TOKEN }}
@@ -66,10 +70,42 @@ jobs:
             const FILTER_MODE = (process.env.FILTER_MODE || "OR").toUpperCase();
             const AUTO_ADD = (process.env.AUTO_ADD || 'false') === 'true';
 
+            const LOG_MODE = (process.env.LOG_MODE || "filtered").toLowerCase(); // off|filtered|matched|all
+            const LOG_LIMIT = parseInt(process.env.LOG_LIMIT || "200", 10);
+            let logCount = 0;
+            let logSuppressed = false;
+
             const labelSet = new Set(FILTER_LABELS);
             const featureSet = new Set(FEATURE_VALUES);
 
-            // repositoryOwner(login: ...) を使って User/Org どちらでも安全に取得
+            function canLog(ok) {
+              if (LOG_MODE === 'off') return false;
+              if (LOG_MODE === 'all') return true;
+              if (LOG_MODE === 'matched') return !!ok;
+              if (LOG_MODE === 'filtered') return !ok;
+              return false;
+            }
+            function maybeLog(msg) {
+              if (!msg) return;
+              if (logSuppressed) return;
+              if (logCount < LOG_LIMIT) {
+                core.info(msg);
+                logCount++;
+              } else if (!logSuppressed) {
+                core.info(`[filter] (further logs suppressed after ${LOG_LIMIT} lines)`);
+                logSuppressed = true;
+              }
+            }
+            function itemKey(parent, contentId) {
+              const c = parent.itemByContentId[contentId]?.content;
+              if (!c) return contentId;
+              if (c.__typename === 'Issue' || c.__typename === 'PullRequest') {
+                return `${c.repository.nameWithOwner}#${c.number}`;
+              }
+              return `${c.__typename}:${contentId}`;
+            }
+
+            // repositoryOwner(login: ...) で User/Org どちらでも取得
             async function getProject(ownerLogin, number) {
               const q = `
               query($login:String!,$number:Int!,$after:String) {
@@ -77,8 +113,7 @@ jobs:
                   __typename
                   ... on User {
                     projectV2(number:$number){
-                      id
-                      title
+                      id title
                       fields(first:100){
                         nodes{
                           __typename
@@ -93,14 +128,12 @@ jobs:
                           content{
                             __typename
                             ... on Issue {
-                              id
-                              number
+                              id number
                               repository { nameWithOwner }
                               labels(first:100){ nodes{ name } }
                             }
                             ... on PullRequest {
-                              id
-                              number
+                              id number
                               repository { nameWithOwner }
                               labels(first:100){ nodes{ name } }
                             }
@@ -124,8 +157,7 @@ jobs:
                   }
                   ... on Organization {
                     projectV2(number:$number){
-                      id
-                      title
+                      id title
                       fields(first:100){
                         nodes{
                           __typename
@@ -140,14 +172,12 @@ jobs:
                           content{
                             __typename
                             ... on Issue {
-                              id
-                              number
+                              id number
                               repository { nameWithOwner }
                               labels(first:100){ nodes{ name } }
                             }
                             ... on PullRequest {
-                              id
-                              number
+                              id number
                               repository { nameWithOwner }
                               labels(first:100){ nodes{ name } }
                             }
@@ -208,7 +238,7 @@ jobs:
                   if (fv.__typename === 'ProjectV2ItemFieldSingleSelectValue') {
                     const fieldName = fv.field?.name;
                     if (fieldName === FIELD_STATUS) v.statusName = fv.name || null;
-                    if (fieldName === FEATURE_FIELD_NAME) v.featureName = fv.name || null;
+                    if (fieldName === FEATURE_FIELD_NAME) v.featureName = fv.name || null; // single-select option name
                   } else if (fv.__typename === 'ProjectV2ItemFieldDateValue') {
                     const fieldName = fv.field?.name;
                     if (fieldName === FIELD_START) v.startDate = fv.date || null;
@@ -228,47 +258,59 @@ jobs:
               };
             }
 
-            async function addItem(projectId, contentId) {
-              const m = `
-              mutation($projectId:ID!,$contentId:ID!){
-                addProjectV2ItemById(input:{projectId:$projectId, contentId:$contentId}){
-                  item { id }
-                }
-              }`;
-              try {
-                const res = await github.graphql(m, { projectId, contentId });
-                return res.addProjectV2ItemById.item.id;
-              } catch (e) {
-                core.warning(`addProjectV2ItemById failed: ${e.message}`);
-                return null;
-              }
-            }
-
-            async function updateField(projectId, itemId, fieldId, value) {
-              const m = `
-              mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:ProjectV2FieldValue!){
-                updateProjectV2ItemFieldValue(input:{
-                  projectId:$projectId, itemId:$itemId, fieldId:$fieldId, value:$value
-                }){
-                  projectV2Item{ id }
-                }
-              }`;
-              await github.graphql(m, { projectId, itemId, fieldId, value });
-            }
-
-            function shouldSync(contentId, parent) {
+            // フィルタ評価 + 詳細ログ用情報
+            function evaluateSync(contentId, parent) {
               const labels = parent.labelsByContentId[contentId] || [];
               const vals = parent.valuesByContentId[contentId] || {};
+              const featureName = vals.featureName || null;
 
-              const matchLabel = labelSet.size === 0 ? false : labels.some(l => labelSet.has(l));
-              const matchFeature = featureSet.size === 0 ? false : (vals.featureName ? featureSet.has(vals.featureName) : false);
+              const matchedLabels = labelSet.size ? labels.filter(l => labelSet.has(l)) : [];
+              const matchLabel = matchedLabels.length > 0;
+              const matchFeature = featureSet.size ? !!(featureName && featureSet.has(featureName)) : false;
 
-              if (labelSet.size === 0 && featureSet.size === 0) return true;
-              if (FILTER_MODE === 'AND') return matchLabel && matchFeature;
-              return matchLabel || matchFeature;
+              let ok;
+              if (labelSet.size === 0 && featureSet.size === 0) {
+                ok = true; // フィルタ未設定なら全件同期
+              } else if (FILTER_MODE === 'AND') {
+                const needLabel = labelSet.size > 0;
+                const needFeature = featureSet.size > 0;
+                const okLabel = needLabel ? matchLabel : false;
+                const okFeature = needFeature ? matchFeature : false;
+                ok = okLabel && okFeature;
+              } else {
+                ok = matchLabel || matchFeature; // OR
+              }
+
+              return {
+                ok,
+                labels,
+                matchedLabels,
+                featureName,
+                matchLabel,
+                matchFeature
+              };
             }
 
-            // 親を取得
+            // フィルタ評価ログ出力
+            function logDecision(contentId, parent, evalRes) {
+              const key = itemKey(parent, contentId);
+              const parts = [];
+              parts.push(`ok=${evalRes.ok}`);
+              parts.push(`mode=${FILTER_MODE}`);
+              if (labelSet.size > 0) {
+                parts.push(`labels=[${(evalRes.labels || []).join(", ")}]`);
+                parts.push(`matchedLabels=[${(evalRes.matchedLabels || []).join(", ")}]`);
+              }
+              if (featureSet.size > 0) {
+                parts.push(`feature="${evalRes.featureName ?? "-"}"`);
+                parts.push(`featureMatched=${evalRes.matchFeature}`);
+              }
+              maybeLog(`[filter] ${key} | ${parts.join(" | ")}`);
+            }
+
+            core.info(`Owner=${OWNER} | Filter labels=[${FILTER_LABELS.join(", ")}], featureField="${FEATURE_FIELD_NAME}", featureValues=[${FEATURE_VALUES.join(", ")}], mode=${FILTER_MODE}, LOG_MODE=${LOG_MODE}, LOG_LIMIT=${LOG_LIMIT}`);
+
+            // 親プロジェクト取得
             const parent = await getProject(OWNER, PARENT_NUM);
             core.info(`Parent: ${parent.title}`);
 
@@ -281,54 +323,101 @@ jobs:
 
             // 子へ同期
             for (const childNum of CHILD_NUMS) {
-              const child = await getProject(OWNER, childNum);
-              core.info(`Child: ${child.title}`);
+              core.startGroup(`Sync -> Child Project #${childNum}`);
+              try {
+                const child = await getProject(OWNER, childNum);
+                core.info(`Child: ${child.title}`);
 
-              const childStatusField = child.fieldByName[FIELD_STATUS];
-              const childStartField = child.fieldByName[FIELD_START];
-              const childEndField = child.fieldByName[FIELD_END];
+                const childStatusField = child.fieldByName[FIELD_STATUS];
+                const childStartField = child.fieldByName[FIELD_START];
+                const childEndField = child.fieldByName[FIELD_END];
 
-              if (!childStatusField || !childStartField || !childEndField) {
-                core.warning(`Child ${child.title}: Missing fields. Status:${!!childStatusField} startDate:${!!childStartField} endDate:${!!childEndField}`);
-              }
-
-              const childStatusOptions = {};
-              if (childStatusField?.options) {
-                for (const opt of childStatusField.options) childStatusOptions[opt.name] = opt.id;
-              }
-
-              let updated = 0, skipped = 0, added = 0, filteredOut = 0;
-
-              for (const [contentId, parentVals] of Object.entries(parent.valuesByContentId)) {
-                if (!shouldSync(contentId, parent)) { filteredOut++; continue; }
-
-                let childItem = child.itemByContentId[contentId];
-                if (!childItem && AUTO_ADD) {
-                  const newItemId = await addItem(child.id, contentId);
-                  if (newItemId) { childItem = { itemId: newItemId }; added++; }
+                if (!childStatusField || !childStartField || !childEndField) {
+                  core.warning(`Child ${child.title}: Missing fields. Status:${!!childStatusField} startDate:${!!childStartField} endDate:${!!childEndField}`);
                 }
-                if (!childItem) { skipped++; continue; }
 
-                const itemId = childItem.itemId;
+                // Status 選択肢マップ（name -> optionId）
+                const childStatusOptions = {};
+                if (childStatusField?.options) {
+                  for (const opt of childStatusField.options) childStatusOptions[opt.name] = opt.id;
+                }
 
-                if (parentVals.statusName && childStatusField) {
-                  const targetOptId = childStatusOptions[parentVals.statusName];
-                  if (targetOptId) {
-                    await updateField(child.id, itemId, childStatusField.id, { singleSelectOptionId: targetOptId });
+                let updated = 0, skipped = 0, added = 0, filteredOut = 0;
+
+                for (const [contentId, parentVals] of Object.entries(parent.valuesByContentId)) {
+                  const evalRes = evaluateSync(contentId, parent);
+                  if (canLog(evalRes.ok)) {
+                    logDecision(contentId, parent, evalRes);
+                  }
+                  if (!evalRes.ok) { filteredOut++; continue; }
+
+                  // 子に無ければ追加
+                  let childItem = child.itemByContentId[contentId];
+                  if (!childItem && AUTO_ADD) {
+                    const newItemId = await (async () => {
+                      const m = `
+                      mutation($projectId:ID!,$contentId:ID!){
+                        addProjectV2ItemById(input:{projectId:$projectId, contentId:$contentId}){
+                          item { id }
+                        }
+                      }`;
+                      try {
+                        const res = await github.graphql(m, { projectId: child.id, contentId });
+                        return res.addProjectV2ItemById.item.id;
+                      } catch (e) {
+                        core.warning(`addProjectV2ItemById failed: ${e.message}`);
+                        return null;
+                      }
+                    })();
+                    if (newItemId) { childItem = { itemId: newItemId }; added++; }
+                  }
+                  if (!childItem) { skipped++; continue; }
+
+                  const itemId = childItem.itemId;
+
+                  // Status
+                  if (parentVals.statusName && childStatusField) {
+                    const targetOptId = childStatusOptions[parentVals.statusName];
+                    if (targetOptId) {
+                      const m = `
+                      mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:ProjectV2FieldValue!){
+                        updateProjectV2ItemFieldValue(input:{
+                          projectId:$projectId, itemId:$itemId, fieldId:$fieldId, value:$value
+                        }){ projectV2Item{ id } }
+                      }`;
+                      await github.graphql(m, { projectId: child.id, itemId, fieldId: childStatusField.id, value: { singleSelectOptionId: targetOptId } });
+                      updated++;
+                    } else {
+                      core.warning(`Child ${child.title}: Status option "${parentVals.statusName}" not found for ${itemKey(parent, contentId)}`);
+                    }
+                  }
+                  // startDate
+                  if (parentVals.startDate && childStartField) {
+                    const m = `
+                    mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:ProjectV2FieldValue!){
+                      updateProjectV2ItemFieldValue(input:{
+                        projectId:$projectId, itemId:$itemId, fieldId:$fieldId, value:$value
+                      }){ projectV2Item{ id } }
+                    }`;
+                    await github.graphql(m, { projectId: child.id, itemId, fieldId: childStartField.id, value: { date: parentVals.startDate } });
                     updated++;
-                  } else {
-                    core.warning(`Child ${child.title}: Status option "${parentVals.statusName}" not found.`);
+                  }
+                  // endDate
+                  if (parentVals.endDate && childEndField) {
+                    const m = `
+                    mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:ProjectV2FieldValue!){
+                      updateProjectV2ItemFieldValue(input:{
+                        projectId:$projectId, itemId:$itemId, fieldId:$fieldId, value:$value
+                      }){ projectV2Item{ id } }
+                    }`;
+                    await github.graphql(m, { projectId: child.id, itemId, fieldId: childEndField.id, value: { date: parentVals.endDate } });
+                    updated++;
                   }
                 }
-                if (parentVals.startDate && childStartField) {
-                  await updateField(child.id, itemId, childStartField.id, { date: parentVals.startDate });
-                  updated++;
-                }
-                if (parentVals.endDate && childEndField) {
-                  await updateField(child.id, itemId, childEndField.id, { date: parentVals.endDate });
-                  updated++;
-                }
+
+                core.info(`Child ${child.title}: updated=${updated} skipped=${skipped} added=${added} filteredOut=${filteredOut}`);
+              } finally {
+                core.endGroup();
               }
-              core.info(`Child ${child.title}: updated=${updated} skipped=${skipped} added=${added} filteredOut=${filteredOut}`);
             }
 

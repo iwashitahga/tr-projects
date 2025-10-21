@@ -18,7 +18,7 @@ on:
       auto_add:
         description: Add missing items to child projects if not present
         type: boolean
-        default: false
+        default: true
   schedule:
     - cron: "*/15 * * * *"
 

@@ -60,133 +60,109 @@ jobs:
             const FIELD_START = process.env.FIELD_START;
             const FIELD_END = process.env.FIELD_END;
 
-            const FILTER_LABELS = (process.env.FILTER_LABELS || "")
-              .split(",").map(s=>s.trim()).filter(Boolean);
+            const FILTER_LABELS = (process.env.FILTER_LABELS || "").split(",").map(s=>s.trim()).filter(Boolean);
             const FEATURE_FIELD_NAME = process.env.FEATURE_FIELD_NAME || "機能名";
-            const FEATURE_VALUES = (process.env.FEATURE_VALUES || "")
-              .split(",").map(s=>s.trim()).filter(Boolean);
-            const FILTER_MODE = (process.env.FILTER_MODE || "OR").toUpperCase(); // OR / AND
+            const FEATURE_VALUES = (process.env.FEATURE_VALUES || "").split(",").map(s=>s.trim()).filter(Boolean);
+            const FILTER_MODE = (process.env.FILTER_MODE || "OR").toUpperCase();
             const AUTO_ADD = (process.env.AUTO_ADD || 'false') === 'true';
 
-            function toSet(arr){ return new Set(arr || []); }
-            const labelSet = toSet(FILTER_LABELS);
-            const featureSet = toSet(FEATURE_VALUES);
+            const labelSet = new Set(FILTER_LABELS);
+            const featureSet = new Set(FEATURE_VALUES);
 
-            core.info(`Owner=${OWNER} | Filter labels=[${FILTER_LABELS.join(", ")}], featureField="${FEATURE_FIELD_NAME}", featureValues=[${FEATURE_VALUES.join(", ")}], mode=${FILTER_MODE}`);
-
-            // 共通クエリ（user/organization の両方を投げ、存在する方を採用）
+            // repositoryOwner(login: ...) を使って User/Org どちらでも安全に取得
             async function getProject(ownerLogin, number) {
               const q = `
               query($login:String!,$number:Int!,$after:String) {
-                user(login:$login) {
-                  projectV2(number:$number){
-                    id
-                    title
-                    fields(first:100){
-                      nodes{
-                        __typename
-                        ... on ProjectV2FieldCommon {
-                          id
-                          name
-                        }
-                        ... on ProjectV2SingleSelectField {
-                          options { id name }
+                repositoryOwner(login:$login) {
+                  __typename
+                  ... on User {
+                    projectV2(number:$number){
+                      id
+                      title
+                      fields(first:100){
+                        nodes{
+                          __typename
+                          ... on ProjectV2FieldCommon { id name }
+                          ... on ProjectV2SingleSelectField { id name options { id name } }
                         }
                       }
-                    }
-                    items(first:100, after:$after){
-                      pageInfo{ hasNextPage endCursor }
-                      nodes{
-                        id
-                        content{
-                          __typename
-                          ... on Issue {
-                            id
-                            number
-                            repository { nameWithOwner }
-                            labels(first:100){ nodes{ name } }
-                          }
-                          ... on PullRequest {
-                            id
-                            number
-                            repository { nameWithOwner }
-                            labels(first:100){ nodes{ name } }
-                          }
-                        }
-                        fieldValues(first:50){
-                          nodes{
+                      items(first:100, after:$after){
+                        pageInfo{ hasNextPage endCursor }
+                        nodes{
+                          id
+                          content{
                             __typename
-                            ... on ProjectV2ItemFieldSingleSelectValue{
-                              field{
-                                __typename
-                                ... on ProjectV2FieldCommon { id name }
-                              }
-                              name
+                            ... on Issue {
+                              id
+                              number
+                              repository { nameWithOwner }
+                              labels(first:100){ nodes{ name } }
                             }
-                            ... on ProjectV2ItemFieldDateValue{
-                              field{
-                                __typename
-                                ... on ProjectV2FieldCommon { id name }
+                            ... on PullRequest {
+                              id
+                              number
+                              repository { nameWithOwner }
+                              labels(first:100){ nodes{ name } }
+                            }
+                          }
+                          fieldValues(first:50){
+                            nodes{
+                              __typename
+                              ... on ProjectV2ItemFieldSingleSelectValue{
+                                field{ __typename ... on ProjectV2FieldCommon { id name } }
+                                name
                               }
-                              date
+                              ... on ProjectV2ItemFieldDateValue{
+                                field{ __typename ... on ProjectV2FieldCommon { id name } }
+                                date
+                              }
                             }
                           }
                         }
                       }
                     }
                   }
-                }
-                organization(login:$login) {
-                  projectV2(number:$number){
-                    id
-                    title
-                    fields(first:100){
-                      nodes{
-                        __typename
-                        ... on ProjectV2FieldCommon {
-                          id
-                          name
-                        }
-                        ... on ProjectV2SingleSelectField {
-                          options { id name }
+                  ... on Organization {
+                    projectV2(number:$number){
+                      id
+                      title
+                      fields(first:100){
+                        nodes{
+                          __typename
+                          ... on ProjectV2FieldCommon { id name }
+                          ... on ProjectV2SingleSelectField { id name options { id name } }
                         }
                       }
-                    }
-                    items(first:100, after:$after){
-                      pageInfo{ hasNextPage endCursor }
-                      nodes{
-                        id
-                        content{
-                          __typename
-                          ... on Issue {
-                            id
-                            number
-                            repository { nameWithOwner }
-                            labels(first:100){ nodes{ name } }
-                          }
-                          ... on PullRequest {
-                            id
-                            number
-                            repository { nameWithOwner }
-                            labels(first:100){ nodes{ name } }
-                          }
-                        }
-                        fieldValues(first:50){
-                          nodes{
+                      items(first:100, after:$after){
+                        pageInfo{ hasNextPage endCursor }
+                        nodes{
+                          id
+                          content{
                             __typename
-                            ... on ProjectV2ItemFieldSingleSelectValue{
-                              field{
-                                __typename
-                                ... on ProjectV2FieldCommon { id name }
-                              }
-                              name
+                            ... on Issue {
+                              id
+                              number
+                              repository { nameWithOwner }
+                              labels(first:100){ nodes{ name } }
                             }
-                            ... on ProjectV2ItemFieldDateValue{
-                              field{
-                                __typename
-                                ... on ProjectV2FieldCommon { id name }
+                            ... on PullRequest {
+                              id
+                              number
+                              repository { nameWithOwner }
+                              labels(first:100){ nodes{ name } }
+                            }
+                          }
+                          fieldValues(first:50){
+                            nodes{
+                              __typename
+                              ... on ProjectV2ItemFieldSingleSelectValue{
+                                field{ __typename ... on ProjectV2FieldCommon { id name } }
+                                name
                               }
-                              date
+                              ... on ProjectV2ItemFieldDateValue{
+                                field{ __typename ... on ProjectV2FieldCommon { id name } }
+                                date
+                              }
                             }
                           }
                         }
@@ -203,24 +179,18 @@ jobs:
 
               do {
                 const res = await github.graphql(q, { login: ownerLogin, number, after });
-                const userProj = res.user?.projectV2 || null;
-                const orgProj  = res.organization?.projectV2 || null;
-                project = userProj || orgProj;
-                if (!project) {
-                  throw new Error(`ProjectV2 not found for ${ownerLogin} #${number}`);
-                }
+                const owner = res.repositoryOwner;
+                if (!owner) throw new Error(`RepositoryOwner not found for login=${ownerLogin}`);
+                project = owner.projectV2;
+                if (!project) throw new Error(`ProjectV2 not found for ${ownerLogin} #${number}`);
                 fields = project.fields.nodes;
                 items.push(...project.items.nodes);
                 after = project.items.pageInfo.hasNextPage ? project.items.pageInfo.endCursor : null;
               } while (after);
 
-              // Field definitions by name
               const fieldByName = {};
-              for (const f of fields) {
-                if (f?.name) fieldByName[f.name] = f;
-              }
+              for (const f of fields) if (f?.name) fieldByName[f.name] = f;
 
-              // Items and values keyed by contentId
               const itemByContentId = {};
               const valuesByContentId = {};
               const labelsByContentId = {};
@@ -230,20 +200,15 @@ jobs:
                 const contentId = it.content.id;
                 itemByContentId[contentId] = { itemId: it.id, content: it.content };
 
-                // Labels
-                let labelNames = [];
-                if (it.content.__typename === 'Issue' || it.content.__typename === 'PullRequest') {
-                  labelNames = (it.content.labels?.nodes || []).map(n => n.name).filter(Boolean);
-                }
+                const labelNames = (it.content.labels?.nodes || []).map(n => n.name).filter(Boolean);
                 labelsByContentId[contentId] = labelNames;
 
-                // Field values to read
                 const v = {};
                 for (const fv of it.fieldValues.nodes || []) {
                   if (fv.__typename === 'ProjectV2ItemFieldSingleSelectValue') {
                     const fieldName = fv.field?.name;
                     if (fieldName === FIELD_STATUS) v.statusName = fv.name || null;
-                    if (fieldName === FEATURE_FIELD_NAME) v.featureName = fv.name || null; // single-select option name
+                    if (fieldName === FEATURE_FIELD_NAME) v.featureName = fv.name || null;
                   } else if (fv.__typename === 'ProjectV2ItemFieldDateValue') {
                     const fieldName = fv.field?.name;
                     if (fieldName === FIELD_START) v.startDate = fv.date || null;
@@ -263,7 +228,6 @@ jobs:
               };
             }
 
-            // Mutations
             async function addItem(projectId, contentId) {
               const m = `
               mutation($projectId:ID!,$contentId:ID!){
@@ -292,7 +256,6 @@ jobs:
               await github.graphql(m, { projectId, itemId, fieldId, value });
             }
 
-            // Filter predicate
             function shouldSync(contentId, parent) {
               const labels = parent.labelsByContentId[contentId] || [];
               const vals = parent.valuesByContentId[contentId] || {};
@@ -300,36 +263,23 @@ jobs:
               const matchLabel = labelSet.size === 0 ? false : labels.some(l => labelSet.has(l));
               const matchFeature = featureSet.size === 0 ? false : (vals.featureName ? featureSet.has(vals.featureName) : false);
 
-              if (labelSet.size === 0 && featureSet.size === 0) {
-                return true; // no filters configured -> sync all
-              }
-              if (FILTER_MODE === 'AND') {
-                const needLabel = labelSet.size > 0;
-                const needFeature = featureSet.size > 0;
-                const okLabel = needLabel ? matchLabel : false;
-                const okFeature = needFeature ? matchFeature : false;
-                return okLabel && okFeature;
-              }
-              return matchLabel || matchFeature; // default OR
+              if (labelSet.size === 0 && featureSet.size === 0) return true;
+              if (FILTER_MODE === 'AND') return matchLabel && matchFeature;
+              return matchLabel || matchFeature;
             }
 
-            // Load parent
+            // 親を取得
             const parent = await getProject(OWNER, PARENT_NUM);
             core.info(`Parent: ${parent.title}`);
 
             const parentStatusField = parent.fieldByName[FIELD_STATUS];
             const parentStartField = parent.fieldByName[FIELD_START];
             const parentEndField = parent.fieldByName[FIELD_END];
-            const parentFeatureField = parent.fieldByName[FEATURE_FIELD_NAME];
-
             if (!parentStatusField) core.warning(`Parent field not found: ${FIELD_STATUS}`);
             if (!parentStartField) core.warning(`Parent field not found: ${FIELD_START}`);
             if (!parentEndField) core.warning(`Parent field not found: ${FIELD_END}`);
-            if (!parentFeatureField) {
-              core.warning(`Parent field not found: ${FEATURE_FIELD_NAME}`);
-            }
 
-            // Sync to children
+            // 子へ同期
             for (const childNum of CHILD_NUMS) {
               const child = await getProject(OWNER, childNum);
               core.info(`Child: ${child.title}`);
@@ -342,7 +292,6 @@ jobs:
                 core.warning(`Child ${child.title}: Missing fields. Status:${!!childStatusField} startDate:${!!childStartField} endDate:${!!childEndField}`);
               }
 
-              // Map child Status options (name -> optionId)
               const childStatusOptions = {};
               if (childStatusField?.options) {
                 for (const opt of childStatusField.options) childStatusOptions[opt.name] = opt.id;
@@ -353,41 +302,33 @@ jobs:
               for (const [contentId, parentVals] of Object.entries(parent.valuesByContentId)) {
                 if (!shouldSync(contentId, parent)) { filteredOut++; continue; }
 
-                // Ensure exists in child
                 let childItem = child.itemByContentId[contentId];
                 if (!childItem && AUTO_ADD) {
                   const newItemId = await addItem(child.id, contentId);
-                  if (newItemId) {
-                    childItem = { itemId: newItemId };
-                    added++;
-                  }
+                  if (newItemId) { childItem = { itemId: newItemId }; added++; }
                 }
                 if (!childItem) { skipped++; continue; }
 
                 const itemId = childItem.itemId;
 
-                // Status
                 if (parentVals.statusName && childStatusField) {
                   const targetOptId = childStatusOptions[parentVals.statusName];
-                  if (!targetOptId) {
-                    core.warning(`Child ${child.title}: Status option "${parentVals.statusName}" not found. Skipping status for content ${contentId}`);
-                  } else {
+                  if (targetOptId) {
                     await updateField(child.id, itemId, childStatusField.id, { singleSelectOptionId: targetOptId });
                     updated++;
+                  } else {
+                    core.warning(`Child ${child.title}: Status option "${parentVals.statusName}" not found.`);
                   }
                 }
-                // startDate
                 if (parentVals.startDate && childStartField) {
                   await updateField(child.id, itemId, childStartField.id, { date: parentVals.startDate });
                   updated++;
                 }
-                // endDate
                 if (parentVals.endDate && childEndField) {
                   await updateField(child.id, itemId, childEndField.id, { date: parentVals.endDate });
                   updated++;
                 }
               }
-
               core.info(`Child ${child.title}: updated=${updated} skipped=${skipped} added=${added} filteredOut=${filteredOut}`);
             }
 

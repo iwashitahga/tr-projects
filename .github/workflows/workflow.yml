@@ -1,0 +1,329 @@
+# .github/workflows/sync-project-fields.yml
+# 目的:
+# - 親プロジェクト -> 子プロジェクト へ一方向に Status / startDate / endDate を同期
+# - 次のいずれかを満たすアイテムのみ同期対象にする:
+#   1) Issue/PR に特定のラベルが付いている
+#   2) 親プロジェクトの single-select フィールド「機能名」が特定の値のいずれかである
+#
+# 準備:
+# - 親/子プロジェクトに同名のフィールドを作成: Status (Single-select), startDate (Date), endDate (Date)
+# - 親/子の Status の選択肢名を一致させる
+# - Org のシークレットに PAT を保存: ORG_PROJECTS_TOKEN (Projects: Read/Write)
+
+name: Sync Projects (parent -> children) with filters
+
+on:
+  workflow_dispatch:
+    inputs:
+      auto_add:
+        description: Add missing items to child projects if not present
+        type: boolean
+        default: false
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
+
+env:
+  ORG: iwashitahga                # 組織のログイン名に置き換え
+  PARENT_PROJECT_NUMBER: "1"        # 親プロジェクト番号に置き換え
+  CHILD_PROJECT_NUMBERS: "2"     # 子プロジェクト番号（カンマ区切り）に置き換え
+
+  # 同期するフィールド名（親・子で同名にしておく）
+  FIELD_STATUS: "Status"             # 単一選択フィールド
+  FIELD_START: "Start date"           # 日付フィールド
+  FIELD_END: "End date"               # 日付フィールド
+
+  # フィルタ設定（いずれかを満たすアイテムのみ同期）
+  FILTER_LABELS: "opg"     # ラベル名（カンマ区切り、空なら無効）
+  FEATURE_FIELD_NAME: "機能名"       # 親プロジェクトに存在する single-select フィールド名
+  FEATURE_VALUES: "五輪"        # 機能名フィールドの許容値（カンマ区切り、空なら無効）
+  FILTER_MODE: "OR"                  # OR（どちらか一致）/ AND（両方一致）
+
+  GH_TOKEN: ${{ secrets.ORG_PROJECTS_TOKEN }}
+  AUTO_ADD: ${{ github.event.inputs.auto_add }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync parent -> children (filtered)
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ env.GH_TOKEN }}
+          script: |
+            const ORG = process.env.ORG;
+            const PARENT_NUM = parseInt(process.env.PARENT_PROJECT_NUMBER, 10);
+            const CHILD_NUMS = process.env.CHILD_PROJECT_NUMBERS.split(",").map(s=>parseInt(s.trim(),10));
+            const FIELD_STATUS = process.env.FIELD_STATUS;
+            const FIELD_START = process.env.FIELD_START;
+            const FIELD_END = process.env.FIELD_END;
+
+            const FILTER_LABELS = (process.env.FILTER_LABELS || "")
+              .split(",").map(s=>s.trim()).filter(Boolean);
+            const FEATURE_FIELD_NAME = process.env.FEATURE_FIELD_NAME || "機能名";
+            const FEATURE_VALUES = (process.env.FEATURE_VALUES || "")
+              .split(",").map(s=>s.trim()).filter(Boolean);
+            const FILTER_MODE = (process.env.FILTER_MODE || "OR").toUpperCase(); // OR / AND
+            const AUTO_ADD = (process.env.AUTO_ADD || 'false') === 'true';
+
+            core.info(`Filter: labels=[${FILTER_LABELS.join(", ")}], featureField="${FEATURE_FIELD_NAME}"(single-select), featureValues=[${FEATURE_VALUES.join(", ")}], mode=${FILTER_MODE}`);
+
+            function toSet(arr){ return new Set(arr || []); }
+            const labelSet = toSet(FILTER_LABELS);
+            const featureSet = toSet(FEATURE_VALUES);
+
+            // 1) Query helper: load a ProjectV2 with all items, field defs, and needed values
+            async function getProject(org, number) {
+              const q = `
+              query($org:String!,$number:Int!,$after:String) {
+                organization(login:$org){
+                  projectV2(number:$number){
+                    id
+                    title
+                    fields(first:100){
+                      nodes{
+                        __typename
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options { id name }
+                        }
+                        ... on ProjectV2Field {
+                          id
+                          name
+                        }
+                      }
+                    }
+                    items(first:100, after:$after){
+                      pageInfo{ hasNextPage endCursor }
+                      nodes{
+                        id
+                        content{
+                          __typename
+                          ... on Issue {
+                            id
+                            number
+                            repository { nameWithOwner }
+                            labels(first:100){ nodes{ name } }
+                          }
+                          ... on PullRequest {
+                            id
+                            number
+                            repository { nameWithOwner }
+                            labels(first:100){ nodes{ name } }
+                          }
+                        }
+                        fieldValues(first:50){
+                          nodes{
+                            __typename
+                            ... on ProjectV2ItemFieldSingleSelectValue{
+                              field{ __typename ... on ProjectV2SingleSelectField { id name } }
+                              name
+                              optionId
+                            }
+                            ... on ProjectV2ItemFieldDateValue{
+                              field{ id name }
+                              date
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }`;
+              let items = [];
+              let after = null;
+              let project, fields;
+              do {
+                const res = await github.graphql(q, { org, number, after });
+                project = res.organization.projectV2;
+                fields = project.fields.nodes;
+                items.push(...project.items.nodes);
+                after = project.items.pageInfo.hasNextPage ? project.items.pageInfo.endCursor : null;
+              } while (after);
+
+              // Field definitions by name
+              const fieldByName = {};
+              for (const f of fields) {
+                if (f?.name) fieldByName[f.name] = f;
+              }
+
+              // Items and values keyed by contentId
+              const itemByContentId = {};
+              const valuesByContentId = {};
+              const labelsByContentId = {};
+
+              for (const it of items) {
+                if (!it.content) continue;
+                const contentId = it.content.id;
+                itemByContentId[contentId] = { itemId: it.id, content: it.content };
+
+                // Collect labels from Issue/PR
+                let labelNames = [];
+                if (it.content.__typename === 'Issue' || it.content.__typename === 'PullRequest') {
+                  labelNames = (it.content.labels?.nodes || []).map(n => n.name).filter(Boolean);
+                }
+                labelsByContentId[contentId] = labelNames;
+
+                // Collect field values we care about
+                const v = {};
+                for (const fv of it.fieldValues.nodes || []) {
+                  if (fv.__typename === 'ProjectV2ItemFieldSingleSelectValue') {
+                    const fieldName = fv.field?.name;
+                    if (fieldName === FIELD_STATUS) v.statusName = fv.name || null;
+                    if (fieldName === FEATURE_FIELD_NAME) v.featureName = fv.name || null; // single-select option name
+                  } else if (fv.__typename === 'ProjectV2ItemFieldDateValue') {
+                    const fieldName = fv.field?.name;
+                    if (fieldName === FIELD_START) v.startDate = fv.date || null;
+                    if (fieldName === FIELD_END) v.endDate = fv.date || null;
+                  }
+                }
+                valuesByContentId[contentId] = v;
+              }
+
+              return {
+                id: project.id,
+                title: project.title,
+                fieldByName,
+                itemByContentId,
+                valuesByContentId,
+                labelsByContentId
+              };
+            }
+
+            // 2) Mutations
+            async function addItem(projectId, contentId) {
+              const m = `
+              mutation($projectId:ID!,$contentId:ID!){
+                addProjectV2ItemById(input:{projectId:$projectId, contentId:$contentId}){
+                  item { id }
+                }
+              }`;
+              try {
+                const res = await github.graphql(m, { projectId, contentId });
+                return res.addProjectV2ItemById.item.id;
+              } catch (e) {
+                core.warning(`addProjectV2ItemById failed: ${e.message}`);
+                return null;
+              }
+            }
+
+            async function updateField(projectId, itemId, fieldId, value) {
+              const m = `
+              mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:ProjectV2FieldValue!){
+                updateProjectV2ItemFieldValue(input:{
+                  projectId:$projectId, itemId:$itemId, fieldId:$fieldId, value:$value
+                }){
+                  projectV2Item{ id }
+                }
+              }`;
+              await github.graphql(m, { projectId, itemId, fieldId, value });
+            }
+
+            // 3) Filter predicate (label OR single-select "機能名")
+            function shouldSync(contentId, parent) {
+              const labels = parent.labelsByContentId[contentId] || [];
+              const vals = parent.valuesByContentId[contentId] || {};
+
+              const matchLabel = labelSet.size === 0 ? false : labels.some(l => labelSet.has(l));
+              const matchFeature = featureSet.size === 0 ? false : (vals.featureName ? featureSet.has(vals.featureName) : false);
+
+              if (labelSet.size === 0 && featureSet.size === 0) {
+                // no filters configured -> do not restrict (sync all)
+                return true;
+              }
+              if (FILTER_MODE === 'AND') {
+                const needLabel = labelSet.size > 0;
+                const needFeature = featureSet.size > 0;
+                const okLabel = needLabel ? matchLabel : false;
+                const okFeature = needFeature ? matchFeature : false;
+                return okLabel && okFeature;
+              }
+              // default OR
+              return matchLabel || matchFeature;
+            }
+
+            // 4) Load parent
+            const parent = await getProject(ORG, PARENT_NUM);
+            core.info(`Parent: ${parent.title}`);
+
+            const parentStatusField = parent.fieldByName[FIELD_STATUS];
+            const parentStartField = parent.fieldByName[FIELD_START];
+            const parentEndField = parent.fieldByName[FIELD_END];
+            const parentFeatureField = parent.fieldByName[FEATURE_FIELD_NAME];
+
+            if (!parentStatusField) core.warning(`Parent field not found: ${FIELD_STATUS}`);
+            if (!parentStartField) core.warning(`Parent field not found: ${FIELD_START}`);
+            if (!parentEndField) core.warning(`Parent field not found: ${FIELD_END}`);
+            if (!parentFeatureField) {
+              core.warning(`Parent field not found: ${FEATURE_FIELD_NAME}`);
+            } else if (parentFeatureField.__typename !== 'ProjectV2SingleSelectField') {
+              core.warning(`Parent field "${FEATURE_FIELD_NAME}" is not Single-select (typename=${parentFeatureField.__typename}). Filtering by feature may not work.`);
+            }
+
+            // 5) For each child: sync items that pass the filter
+            for (const childNum of CHILD_NUMS) {
+              const child = await getProject(ORG, childNum);
+              core.info(`Child: ${child.title}`);
+
+              const childStatusField = child.fieldByName[FIELD_STATUS];
+              const childStartField = child.fieldByName[FIELD_START];
+              const childEndField = child.fieldByName[FIELD_END];
+
+              if (!childStatusField || !childStartField || !childEndField) {
+                core.warning(`Child ${child.title}: Missing fields. Status:${!!childStatusField} startDate:${!!childStartField} endDate:${!!childEndField}`);
+              }
+
+              // map child status options
+              const childStatusOptions = {};
+              if (childStatusField?.options) {
+                for (const opt of childStatusField.options) childStatusOptions[opt.name] = opt.id;
+              }
+
+              let updated = 0, skipped = 0, added = 0, filteredOut = 0;
+
+              for (const [contentId, parentVals] of Object.entries(parent.valuesByContentId)) {
+                // Apply filter (labels on parent issue/PR and/or single-select "機能名" on parent)
+                if (!shouldSync(contentId, parent)) { filteredOut++; continue; }
+
+                // Ensure exists in child (or add if AUTO_ADD)
+                let childItem = child.itemByContentId[contentId];
+                if (!childItem && AUTO_ADD) {
+                  const newItemId = await addItem(child.id, contentId);
+                  if (newItemId) {
+                    childItem = { itemId: newItemId };
+                    added++;
+                  }
+                }
+                if (!childItem) { skipped++; continue; }
+
+                const itemId = childItem.itemId;
+
+                // Status
+                if (parentVals.statusName && childStatusField) {
+                  const targetOptId = childStatusOptions[parentVals.statusName];
+                  if (!targetOptId) {
+                    core.warning(`Child ${child.title}: Status option "${parentVals.statusName}" not found. Skipping status for content ${contentId}`);
+                  } else {
+                    await updateField(child.id, itemId, childStatusField.id, { singleSelectOptionId: targetOptId });
+                    updated++;
+                  }
+                }
+                // startDate
+                if (parentVals.startDate && childStartField) {
+                  await updateField(child.id, itemId, childStartField.id, { date: parentVals.startDate });
+                  updated++;
+                }
+                // endDate
+                if (parentVals.endDate && childEndField) {
+                  await updateField(child.id, itemId, childEndField.id, { date: parentVals.endDate });
+                  updated++;
+                }
+              }
+
+              core.info(`Child ${child.title}: updated=${updated} skipped=${skipped} added=${added} filteredOut=${filteredOut}`);
+            }
+

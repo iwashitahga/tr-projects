@@ -70,10 +70,9 @@ jobs:
             const FILTER_MODE = (process.env.FILTER_MODE || "OR").toUpperCase();
             const AUTO_ADD = (process.env.AUTO_ADD || 'false') === 'true';
 
-            const LOG_MODE = (process.env.LOG_MODE || "filtered").toLowerCase(); // off|filtered|matched|all
+            const LOG_MODE = (process.env.LOG_MODE || "filtered").toLowerCase();
             const LOG_LIMIT = parseInt(process.env.LOG_LIMIT || "200", 10);
-            let logCount = 0;
-            let logSuppressed = false;
+            let logCount = 0, logSuppressed = false;
 
             const labelSet = new Set(FILTER_LABELS);
             const featureSet = new Set(FEATURE_VALUES);
@@ -86,8 +85,7 @@ jobs:
               return false;
             }
             function maybeLog(msg) {
-              if (!msg) return;
-              if (logSuppressed) return;
+              if (!msg || logSuppressed) return;
               if (logCount < LOG_LIMIT) {
                 core.info(msg);
                 logCount++;
@@ -96,8 +94,8 @@ jobs:
                 logSuppressed = true;
               }
             }
-            function itemKey(parent, contentId) {
-              const c = parent.itemByContentId[contentId]?.content;
+            function itemKey(project, contentId) {
+              const c = project.itemByContentId[contentId]?.content;
               if (!c) return contentId;
               if (c.__typename === 'Issue' || c.__typename === 'PullRequest') {
                 return `${c.repository.nameWithOwner}#${c.number}`;
@@ -105,7 +103,7 @@ jobs:
               return `${c.__typename}:${contentId}`;
             }
 
-            // repositoryOwner(login: ...) で User/Org どちらでも取得
+            // User/Org どちらでも取得
             async function getProject(ownerLogin, number) {
               const q = `
               query($login:String!,$number:Int!,$after:String) {
@@ -224,28 +222,34 @@ jobs:
               const itemByContentId = {};
               const valuesByContentId = {};
               const labelsByContentId = {};
+              const rawFieldValuesByContentId = {}; // 新規: 生のフィールド値（fieldId/fieldName/type含む）
 
               for (const it of items) {
                 if (!it.content) continue;
                 const contentId = it.content.id;
                 itemByContentId[contentId] = { itemId: it.id, content: it.content };
 
-                const labelNames = (it.content.labels?.nodes || []).map(n => n.name).filter(Boolean);
-                labelsByContentId[contentId] = labelNames;
+                // labels
+                labelsByContentId[contentId] = (it.content.labels?.nodes || []).map(n => n.name).filter(Boolean);
 
+                // 既存: 主要フィールドは名前ベースでも取っておく（status/date）
                 const v = {};
+                const raw = [];
                 for (const fv of it.fieldValues.nodes || []) {
                   if (fv.__typename === 'ProjectV2ItemFieldSingleSelectValue') {
+                    raw.push({ type: fv.__typename, fieldId: fv.field?.id, fieldName: fv.field?.name, name: fv.name });
                     const fieldName = fv.field?.name;
                     if (fieldName === FIELD_STATUS) v.statusName = fv.name || null;
-                    if (fieldName === FEATURE_FIELD_NAME) v.featureName = fv.name || null; // single-select option name
+                    // 機能名はここでは確定しない（後で fieldId で特定）
                   } else if (fv.__typename === 'ProjectV2ItemFieldDateValue') {
+                    raw.push({ type: fv.__typename, fieldId: fv.field?.id, fieldName: fv.field?.name, date: fv.date });
                     const fieldName = fv.field?.name;
                     if (fieldName === FIELD_START) v.startDate = fv.date || null;
                     if (fieldName === FIELD_END) v.endDate = fv.date || null;
                   }
                 }
                 valuesByContentId[contentId] = v;
+                rawFieldValuesByContentId[contentId] = raw;
               }
 
               return {
@@ -254,31 +258,60 @@ jobs:
                 fieldByName,
                 itemByContentId,
                 valuesByContentId,
-                labelsByContentId
+                labelsByContentId,
+                rawFieldValuesByContentId
               };
             }
 
-            // フィルタ評価 + 詳細ログ用情報
-            function evaluateSync(contentId, parent) {
+            // 親プロジェクト取得
+            core.info(`Owner=${OWNER} | Filter labels=[${FILTER_LABELS.join(", ")}], featureField="${FEATURE_FIELD_NAME}", featureValues=[${FEATURE_VALUES.join(", ")}], mode=${FILTER_MODE}, LOG_MODE=${LOG_MODE}, LOG_LIMIT=${LOG_LIMIT}`);
+            const parent = await getProject(OWNER, PARENT_NUM);
+            core.info(`Parent: ${parent.title}`);
+
+            const parentStatusField = parent.fieldByName[FIELD_STATUS];
+            const parentStartField = parent.fieldByName[FIELD_START];
+            const parentEndField = parent.fieldByName[FIELD_END];
+            const parentFeatureField = parent.fieldByName[FEATURE_FIELD_NAME];
+
+            if (!parentStatusField) core.warning(`Parent field not found: ${FIELD_STATUS}`);
+            if (!parentStartField) core.warning(`Parent field not found: ${FIELD_START}`);
+            if (!parentEndField) core.warning(`Parent field not found: ${FIELD_END}`);
+            if (!parentFeatureField) core.warning(`Parent field not found: ${FEATURE_FIELD_NAME}`);
+
+            const FEATURE_FIELD_ID = parentFeatureField?.id || null;
+            core.info(`Feature field id (parent): ${FEATURE_FIELD_ID ?? 'N/A'}`);
+
+            // fieldId で機能名を取り出す
+            function getFeatureNameFromParent(contentId) {
+              const raw = parent.rawFieldValuesByContentId[contentId] || [];
+              // 1) ID で一致
+              let node = null;
+              if (FEATURE_FIELD_ID) {
+                node = raw.find(r => r.type === 'ProjectV2ItemFieldSingleSelectValue' && r.fieldId === FEATURE_FIELD_ID);
+              }
+              // 2) 念のため名前一致のフォールバック
+              if (!node) {
+                node = raw.find(r => r.type === 'ProjectV2ItemFieldSingleSelectValue' && r.fieldName === FEATURE_FIELD_NAME);
+              }
+              return node?.name || null;
+            }
+
+            // フィルタ評価（設定済みフィルタのみ対象）＋詳細ログ
+            function evaluateSync(contentId) {
               const labels = parent.labelsByContentId[contentId] || [];
-              const vals = parent.valuesByContentId[contentId] || {};
-              const featureName = vals.featureName || null;
+              const featureName = getFeatureNameFromParent(contentId);
 
               const configured = [];
-              if (labelSet.size > 0) {
-                configured.push({ key: 'label', matched: labels.some(l => labelSet.has(l)) });
-              }
-              if (featureSet.size > 0) {
-                configured.push({ key: 'feature', matched: !!(featureName && featureSet.has(featureName)) });
-              }
+              if (labelSet.size > 0) configured.push({ key: 'label', matched: labels.some(l => labelSet.has(l)) });
+              if (featureSet.size > 0) configured.push({ key: 'feature', matched: !!(featureName && featureSet.has(featureName)) });
 
               let ok;
               if (configured.length === 0) {
-                ok = true; // フィルタ未設定なら全件同期
+                ok = true;
               } else if (FILTER_MODE === 'AND') {
                 ok = configured.every(c => c.matched);
               } else {
-                ok = configured.some(c => c.matched); // OR
+                ok = configured.some(c => c.matched);
               }
 
               return {
@@ -291,8 +324,7 @@ jobs:
               };
             }
 
-            // フィルタ評価ログ出力
-            function logDecision(contentId, parent, evalRes) {
+            function logDecision(contentId, evalRes) {
               const key = itemKey(parent, contentId);
               const parts = [];
               parts.push(`ok=${evalRes.ok}`);
@@ -300,6 +332,7 @@ jobs:
               if (labelSet.size > 0) {
                 parts.push(`labels=[${(evalRes.labels || []).join(", ")}]`);
                 parts.push(`matchedLabels=[${(evalRes.matchedLabels || []).join(", ")}]`);
+                parts.push(`labelMatched=${evalRes.matchLabel}`);
               }
               if (featureSet.size > 0) {
                 parts.push(`feature="${evalRes.featureName ?? "-"}"`);
@@ -307,19 +340,6 @@ jobs:
               }
               maybeLog(`[filter] ${key} | ${parts.join(" | ")}`);
             }
-
-            core.info(`Owner=${OWNER} | Filter labels=[${FILTER_LABELS.join(", ")}], featureField="${FEATURE_FIELD_NAME}", featureValues=[${FEATURE_VALUES.join(", ")}], mode=${FILTER_MODE}, LOG_MODE=${LOG_MODE}, LOG_LIMIT=${LOG_LIMIT}`);
-
-            // 親プロジェクト取得
-            const parent = await getProject(OWNER, PARENT_NUM);
-            core.info(`Parent: ${parent.title}`);
-
-            const parentStatusField = parent.fieldByName[FIELD_STATUS];
-            const parentStartField = parent.fieldByName[FIELD_START];
-            const parentEndField = parent.fieldByName[FIELD_END];
-            if (!parentStatusField) core.warning(`Parent field not found: ${FIELD_STATUS}`);
-            if (!parentStartField) core.warning(`Parent field not found: ${FIELD_START}`);
-            if (!parentEndField) core.warning(`Parent field not found: ${FIELD_END}`);
 
             // 子へ同期
             for (const childNum of CHILD_NUMS) {
@@ -336,7 +356,7 @@ jobs:
                   core.warning(`Child ${child.title}: Missing fields. Status:${!!childStatusField} startDate:${!!childStartField} endDate:${!!childEndField}`);
                 }
 
-                // Status 選択肢マップ（name -> optionId）
+                // Status オプション map
                 const childStatusOptions = {};
                 if (childStatusField?.options) {
                   for (const opt of childStatusField.options) childStatusOptions[opt.name] = opt.id;
@@ -345,31 +365,28 @@ jobs:
                 let updated = 0, skipped = 0, added = 0, filteredOut = 0;
 
                 for (const [contentId, parentVals] of Object.entries(parent.valuesByContentId)) {
-                  const evalRes = evaluateSync(contentId, parent);
-                  if (canLog(evalRes.ok)) {
-                    logDecision(contentId, parent, evalRes);
+                  const evalRes = evaluateSync(contentId);
+                  if ((LOG_MODE !== 'off') && ((LOG_MODE === 'all') || (LOG_MODE === 'matched' && evalRes.ok) || (LOG_MODE === 'filtered' && !evalRes.ok))) {
+                    logDecision(contentId, evalRes);
                   }
                   if (!evalRes.ok) { filteredOut++; continue; }
 
                   // 子に無ければ追加
                   let childItem = child.itemByContentId[contentId];
                   if (!childItem && AUTO_ADD) {
-                    const newItemId = await (async () => {
-                      const m = `
-                      mutation($projectId:ID!,$contentId:ID!){
-                        addProjectV2ItemById(input:{projectId:$projectId, contentId:$contentId}){
-                          item { id }
-                        }
-                      }`;
-                      try {
-                        const res = await github.graphql(m, { projectId: child.id, contentId });
-                        return res.addProjectV2ItemById.item.id;
-                      } catch (e) {
-                        core.warning(`addProjectV2ItemById failed: ${e.message}`);
-                        return null;
+                    const m = `
+                    mutation($projectId:ID!,$contentId:ID!){
+                      addProjectV2ItemById(input:{projectId:$projectId, contentId:$contentId}){
+                        item { id }
                       }
-                    })();
-                    if (newItemId) { childItem = { itemId: newItemId }; added++; }
+                    }`;
+                    try {
+                      const res = await github.graphql(m, { projectId: child.id, contentId });
+                      const newItemId = res.addProjectV2ItemById.item.id;
+                      if (newItemId) { childItem = { itemId: newItemId }; added++; }
+                    } catch (e) {
+                      core.warning(`addProjectV2ItemById failed: ${e.message}`);
+                    }
                   }
                   if (!childItem) { skipped++; continue; }
 

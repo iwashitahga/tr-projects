@@ -45,6 +45,10 @@ env:
   LOG_MODE: "all"               # off | filtered | matched | all
   LOG_LIMIT: "200"                   # ログ行数上限
 
+  DUMP_GRAPHQL: "parent"     # off | parent | children | all
+  DUMP_ITEMS_LIMIT: "20"     # 何件まで出すか
+  DUMP_FIRST_RAW: "true"    # true で最初の 1 件を util.inspect 生出力
+
   GH_TOKEN: ${{ secrets.ORG_PROJECTS_TOKEN }}
   AUTO_ADD: ${{ github.event.inputs.auto_add }}
 
@@ -52,7 +56,7 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Sync parent -> children (filtered, with logging)
+      - name: Sync (with GraphQL items dump)
         uses: actions/github-script@v7
         with:
           github-token: ${{ env.GH_TOKEN }}
@@ -72,39 +76,55 @@ jobs:
 
             const LOG_MODE = (process.env.LOG_MODE || "filtered").toLowerCase();
             const LOG_LIMIT = parseInt(process.env.LOG_LIMIT || "200", 10);
-            let logCount = 0, logSuppressed = false;
+
+            const DUMP_GRAPHQL = (process.env.DUMP_GRAPHQL || "off").toLowerCase(); // off|parent|children|all
+            const DUMP_ITEMS_LIMIT = parseInt(process.env.DUMP_ITEMS_LIMIT || "20", 10);
+            const DUMP_FIRST_RAW = (process.env.DUMP_FIRST_RAW || "false").toLowerCase() === "true";
 
             const labelSet = new Set(FILTER_LABELS);
             const featureSet = new Set(FEATURE_VALUES);
 
-            function canLog(ok) {
-              if (LOG_MODE === 'off') return false;
-              if (LOG_MODE === 'all') return true;
-              if (LOG_MODE === 'matched') return !!ok;
-              if (LOG_MODE === 'filtered') return !ok;
-              return false;
-            }
-            function maybeLog(msg) {
-              if (!msg || logSuppressed) return;
-              if (logCount < LOG_LIMIT) {
-                core.info(msg);
-                logCount++;
-              } else if (!logSuppressed) {
-                core.info(`[filter] (further logs suppressed after ${LOG_LIMIT} lines)`);
-                logSuppressed = true;
+            // GraphQL items をそのままに近い形でダンプ
+            function dumpGraphQLItems(title, nodes, limit = 20) {
+              const util = require('util');
+              const total = nodes.length;
+              const take = Math.min(limit, total);
+              const trimmed = nodes.slice(0, take).map(n => ({
+                id: n.id,
+                content: n.content ? {
+                  __typename: n.content.__typename,
+                  number: n.content.number ?? null,
+                  repository: n.content.repository?.nameWithOwner ?? null,
+                  labels: (n.content.labels?.nodes || []).map(l => l.name).filter(Boolean)
+                } : null,
+                // fieldValues は必要箇所だけ整形
+                fieldValues: (n.fieldValues?.nodes || []).map(fv => ({
+                  __typename: fv.__typename,
+                  field: {
+                    // SingleSelect は id/name を ProjectV2SingleSelectField から取得
+                    name: fv.field?.name ?? null,
+                    id: fv.field?.id ?? null,
+                    __typename: fv.field?.__typename ?? null
+                  },
+                  // SingleSelect の場合
+                  optionId: fv.optionId ?? undefined,
+                  name: fv.name ?? undefined,
+                  // Date の場合
+                  date: fv.date ?? undefined
+                }))
+              }));
+
+              core.startGroup(`GraphQL items dump: ${title} (first ${take}/${total})`);
+              core.info(JSON.stringify(trimmed, null, 2));
+              if (DUMP_FIRST_RAW && total > 0) {
+                core.info('--- first item raw (util.inspect) ---');
+                core.info(util.inspect(nodes[0], { depth: 10, maxArrayLength: 200 }));
               }
-            }
-            function itemKey(project, contentId) {
-              const c = project.itemByContentId[contentId]?.content;
-              if (!c) return contentId;
-              if (c.__typename === 'Issue' || c.__typename === 'PullRequest') {
-                return `${c.repository.nameWithOwner}#${c.number}`;
-              }
-              return `${c.__typename}:${contentId}`;
+              core.endGroup();
             }
 
-            // User/Org どちらでも取得
-            async function getProject(ownerLogin, number) {
+            // repositoryOwner(login: ...) で User/Org どちらでも取得
+            async function getProject(ownerLogin, number, { dump = false } = {}) {
               const q = `
               query($login:String!,$number:Int!,$after:String) {
                 repositoryOwner(login:$login) {
@@ -140,18 +160,12 @@ jobs:
                             nodes{
                               __typename
                               ... on ProjectV2ItemFieldSingleSelectValue{
-                                field{
-                                  __typename
-                                  ... on ProjectV2SingleSelectField { id name }
-                                }
+                                field{ __typename ... on ProjectV2SingleSelectField { id name } }
                                 optionId
                                 name
                               }
                               ... on ProjectV2ItemFieldDateValue{
-                                field{
-                                  __typename
-                                  ... on ProjectV2FieldCommon { id name }
-                                }
+                                field{ __typename ... on ProjectV2FieldCommon { id name } }
                                 date
                               }
                             }
@@ -191,18 +205,12 @@ jobs:
                             nodes{
                               __typename
                               ... on ProjectV2ItemFieldSingleSelectValue{
-                                field{
-                                  __typename
-                                  ... on ProjectV2SingleSelectField { id name }
-                                }
+                                field{ __typename ... on ProjectV2SingleSelectField { id name } }
                                 optionId
                                 name
                               }
                               ... on ProjectV2ItemFieldDateValue{
-                                field{
-                                  __typename
-                                  ... on ProjectV2FieldCommon { id name }
-                                }
+                                field{ __typename ... on ProjectV2FieldCommon { id name } }
                                 date
                               }
                             }
@@ -214,9 +222,9 @@ jobs:
                 }
               }`;
 
-              let items = [];
               let after = null;
               let project = null;
+              let allNodes = [];
               let fields = [];
 
               do {
@@ -226,10 +234,15 @@ jobs:
                 project = owner.projectV2;
                 if (!project) throw new Error(`ProjectV2 not found for ${ownerLogin} #${number}`);
                 fields = project.fields.nodes;
-                items.push(...project.items.nodes);
+                allNodes = allNodes.concat(project.items.nodes);
                 after = project.items.pageInfo.hasNextPage ? project.items.pageInfo.endCursor : null;
               } while (after);
 
+              if (dump) {
+                dumpGraphQLItems(`${project.title}`, allNodes, DUMP_ITEMS_LIMIT);
+              }
+
+              // 紐づけ用のマップ生成
               const fieldByName = {};
               for (const f of fields) if (f?.name) fieldByName[f.name] = f;
 
@@ -238,7 +251,7 @@ jobs:
               const labelsByContentId = {};
               const rawFieldValuesByContentId = {};
 
-              for (const it of items) {
+              for (const it of allNodes) {
                 if (!it.content) continue;
                 const contentId = it.content.id;
                 itemByContentId[contentId] = { itemId: it.id, content: it.content };
@@ -256,8 +269,9 @@ jobs:
                       optionId: fv.optionId || null,
                       name: fv.name || null
                     });
-                    const fieldName = fv.field?.name;
-                    if (fieldName === FIELD_STATUS) v.statusName = fv.name || null;
+                    if (fv.field?.name === FIELD_STATUS) {
+                      v.statusName = fv.name || null;
+                    }
                   } else if (fv.__typename === 'ProjectV2ItemFieldDateValue') {
                     raw.push({
                       type: fv.__typename,
@@ -265,9 +279,8 @@ jobs:
                       fieldName: fv.field?.name,
                       date: fv.date || null
                     });
-                    const fieldName = fv.field?.name;
-                    if (fieldName === FIELD_START) v.startDate = fv.date || null;
-                    if (fieldName === FIELD_END) v.endDate = fv.date || null;
+                    if (fv.field?.name === FIELD_START) v.startDate = fv.date || null;
+                    if (fv.field?.name === FIELD_END) v.endDate = fv.date || null;
                   }
                 }
                 valuesByContentId[contentId] = v;
@@ -285,172 +298,26 @@ jobs:
               };
             }
 
-            core.info(`Owner=${OWNER} | Filter labels=[${FILTER_LABELS.join(", ")}], featureField="${FEATURE_FIELD_NAME}", featureValues=[${FEATURE_VALUES.join(", ")}], mode=${FILTER_MODE}, LOG_MODE=${LOG_MODE}, LOG_LIMIT=${LOG_LIMIT}`);
+            // ここからは「ダンプ」のみ要求にフォーカス
+            core.info(`Owner=${OWNER} | Filter labels=[${FILTER_LABELS.join(", ")}], featureField="${FEATURE_FIELD_NAME}", featureValues=[${FEATURE_VALUES.join(", ")}], mode=${FILTER_MODE}`);
+            const dumpParent = (DUMP_GRAPHQL === 'parent' || DUMP_GRAPHQL === 'all');
+            const dumpChildren = (DUMP_GRAPHQL === 'children' || DUMP_GRAPHQL === 'all');
 
-            // 親プロジェクト取得
-            const parent = await getProject(OWNER, PARENT_NUM);
+            // 親の items をダンプ
+            const parent = await getProject(OWNER, PARENT_NUM, { dump: dumpParent });
             core.info(`Parent: ${parent.title}`);
 
-            const parentStatusField = parent.fieldByName[FIELD_STATUS];
-            const parentStartField = parent.fieldByName[FIELD_START];
-            const parentEndField = parent.fieldByName[FIELD_END];
-            const parentFeatureField = parent.fieldByName[FEATURE_FIELD_NAME];
-
-            if (!parentStatusField) core.warning(`Parent field not found: ${FIELD_STATUS}`);
-            if (!parentStartField) core.warning(`Parent field not found: ${FIELD_START}`);
-            if (!parentEndField) core.warning(`Parent field not found: ${FIELD_END}`);
-            if (!parentFeatureField) core.warning(`Parent field not found: ${FEATURE_FIELD_NAME}`);
-
-            const FEATURE_FIELD_ID = parentFeatureField?.id || null;
-            const FEATURE_OPTIONS = (parentFeatureField?.options || []).reduce((map, o) => { map[o.id] = o.name; return map; }, {});
-            core.info(`Feature field id (parent): ${FEATURE_FIELD_ID ?? 'N/A'}`);
-
-            function resolveFeatureNameFromParent(contentId) {
-              const raw = parent.rawFieldValuesByContentId[contentId] || [];
-              // 1) fieldId で一致する single-select 値を探す
-              let node = null;
-              if (FEATURE_FIELD_ID) {
-                node = raw.find(r => r.type === 'ProjectV2ItemFieldSingleSelectValue' && r.fieldId === FEATURE_FIELD_ID);
-              }
-              // 2) フォールバック: 名前一致
-              if (!node) {
-                node = raw.find(r => r.type === 'ProjectV2ItemFieldSingleSelectValue' && r.fieldName === FEATURE_FIELD_NAME);
-              }
-              if (!node) return null;
-              // 3) name が空の場合は optionId -> 親フィールドの options で解決
-              if (node.name) return node.name;
-              if (node.optionId && FEATURE_OPTIONS[node.optionId]) return FEATURE_OPTIONS[node.optionId];
-              return null;
-            }
-
-            // 評価＋詳細ログ（設定済みフィルタのみ）
-            function evaluateSync(contentId) {
-              const labels = parent.labelsByContentId[contentId] || [];
-              const featureName = resolveFeatureNameFromParent(contentId);
-
-              const configured = [];
-              if (labelSet.size > 0) configured.push({ key: 'label', matched: labels.some(l => labelSet.has(l)) });
-              if (featureSet.size > 0) configured.push({ key: 'feature', matched: !!(featureName && featureSet.has(featureName)) });
-
-              let ok;
-              if (configured.length === 0) ok = true;
-              else if (FILTER_MODE === 'AND') ok = configured.every(c => c.matched);
-              else ok = configured.some(c => c.matched); // OR
-
-              return {
-                ok,
-                labels,
-                matchedLabels: labelSet.size ? labels.filter(l => labelSet.has(l)) : [],
-                featureName,
-                matchLabel: configured.find(c => c.key === 'label')?.matched ?? null,
-                matchFeature: configured.find(c => c.key === 'feature')?.matched ?? null
-              };
-            }
-
-            function logDecision(contentId, evalRes) {
-              const key = itemKey(parent, contentId);
-              const parts = [];
-              parts.push(`ok=${evalRes.ok}`);
-              parts.push(`mode=${FILTER_MODE}`);
-              if (labelSet.size > 0) {
-                parts.push(`labels=[${(evalRes.labels || []).join(", ")}]`);
-                parts.push(`matchedLabels=[${(evalRes.matchedLabels || []).join(", ")}]`);
-                parts.push(`labelMatched=${evalRes.matchLabel}`);
-              }
-              if (featureSet.size > 0) {
-                parts.push(`feature="${evalRes.featureName ?? "-"}"`);
-                parts.push(`featureMatched=${evalRes.matchFeature}`);
-              }
-              maybeLog(`[filter] ${key} | ${parts.join(" | ")}`);
-            }
-
-            // 子へ同期
+            // 子の items もダンプ（必要なら）
             for (const childNum of CHILD_NUMS) {
-              core.startGroup(`Sync -> Child Project #${childNum}`);
+              core.startGroup(`Inspect Child Project #${childNum}`);
               try {
-                const child = await getProject(OWNER, childNum);
+                const child = await getProject(OWNER, childNum, { dump: dumpChildren });
                 core.info(`Child: ${child.title}`);
-
-                const childStatusField = child.fieldByName[FIELD_STATUS];
-                const childStartField = child.fieldByName[FIELD_START];
-                const childEndField = child.fieldByName[FIELD_END];
-
-                if (!childStatusField || !childStartField || !childEndField) {
-                  core.warning(`Child ${child.title}: Missing fields. Status:${!!childStatusField} startDate:${!!childStartField} endDate:${!!childEndField}`);
-                }
-
-                const childStatusOptions = {};
-                if (childStatusField?.options) {
-                  for (const opt of childStatusField.options) childStatusOptions[opt.name] = opt.id;
-                }
-
-                let updated = 0, skipped = 0, added = 0, filteredOut = 0;
-
-                for (const [contentId, parentVals] of Object.entries(parent.valuesByContentId)) {
-                  const evalRes = evaluateSync(contentId);
-                  if (canLog(evalRes.ok)) logDecision(contentId, evalRes);
-                  if (!evalRes.ok) { filteredOut++; continue; }
-
-                  let childItem = child.itemByContentId[contentId];
-                  if (!childItem && AUTO_ADD) {
-                    const m = `
-                    mutation($projectId:ID!,$contentId:ID!){
-                      addProjectV2ItemById(input:{projectId:$projectId, contentId:$contentId}){
-                        item { id }
-                      }
-                    }`;
-                    try {
-                      const res = await github.graphql(m, { projectId: child.id, contentId });
-                      const newItemId = res.addProjectV2ItemById.item.id;
-                      if (newItemId) { childItem = { itemId: newItemId }; added++; }
-                    } catch (e) {
-                      core.warning(`addProjectV2ItemById failed: ${e.message}`);
-                    }
-                  }
-                  if (!childItem) { skipped++; continue; }
-
-                  const itemId = childItem.itemId;
-
-                  if (parentVals.statusName && childStatusField) {
-                    const targetOptId = childStatusOptions[parentVals.statusName];
-                    if (targetOptId) {
-                      const m = `
-                      mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:ProjectV2FieldValue!){
-                        updateProjectV2ItemFieldValue(input:{
-                          projectId:$projectId, itemId:$itemId, fieldId:$fieldId, value:$value
-                        }){ projectV2Item{ id } }
-                      }`;
-                      await github.graphql(m, { projectId: child.id, itemId, fieldId: childStatusField.id, value: { singleSelectOptionId: targetOptId } });
-                      updated++;
-                    } else {
-                      core.warning(`Child ${child.title}: Status option "${parentVals.statusName}" not found for ${itemKey(parent, contentId)}`);
-                    }
-                  }
-                  if (parentVals.startDate && childStartField) {
-                    const m = `
-                    mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:ProjectV2FieldValue!){
-                      updateProjectV2ItemFieldValue(input:{
-                        projectId:$projectId, itemId:$itemId, fieldId:$fieldId, value:$value
-                      }){ projectV2Item{ id } }
-                    }`;
-                    await github.graphql(m, { projectId: child.id, itemId, fieldId: childStartField.id, value: { date: parentVals.startDate } });
-                    updated++;
-                  }
-                  if (parentVals.endDate && childEndField) {
-                    const m = `
-                    mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:ProjectV2FieldValue!){
-                      updateProjectV2ItemFieldValue(input:{
-                        projectId:$projectId, itemId:$itemId, fieldId:$fieldId, value:$value
-                      }){ projectV2Item{ id } }
-                    }`;
-                    await github.graphql(m, { projectId: child.id, itemId, fieldId: childEndField.id, value: { date: parentVals.endDate } });
-                    updated++;
-                  }
-                }
-
-                core.info(`Child ${child.title}: updated=${updated} skipped=${skipped} added=${added} filteredOut=${filteredOut}`);
               } finally {
                 core.endGroup();
               }
             }
+
+            // 取得とダンプのみを行う簡易版です。同期ロジックは意図的に実行しません。
+            // 同期も行いたい場合は、ここから先に既存の同期処理（updateProjectV2ItemFieldValue 等）を差し戻してください。
 

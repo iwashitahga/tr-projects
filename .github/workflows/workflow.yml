@@ -264,30 +264,30 @@ jobs:
               const vals = parent.valuesByContentId[contentId] || {};
               const featureName = vals.featureName || null;
 
-              const matchedLabels = labelSet.size ? labels.filter(l => labelSet.has(l)) : [];
-              const matchLabel = matchedLabels.length > 0;
-              const matchFeature = featureSet.size ? !!(featureName && featureSet.has(featureName)) : false;
+              const configured = [];
+              if (labelSet.size > 0) {
+                configured.push({ key: 'label', matched: labels.some(l => labelSet.has(l)) });
+              }
+              if (featureSet.size > 0) {
+                configured.push({ key: 'feature', matched: !!(featureName && featureSet.has(featureName)) });
+              }
 
               let ok;
-              if (labelSet.size === 0 && featureSet.size === 0) {
+              if (configured.length === 0) {
                 ok = true; // フィルタ未設定なら全件同期
               } else if (FILTER_MODE === 'AND') {
-                const needLabel = labelSet.size > 0;
-                const needFeature = featureSet.size > 0;
-                const okLabel = needLabel ? matchLabel : false;
-                const okFeature = needFeature ? matchFeature : false;
-                ok = okLabel && okFeature;
+                ok = configured.every(c => c.matched);
               } else {
-                ok = matchLabel || matchFeature; // OR
+                ok = configured.some(c => c.matched); // OR
               }
 
               return {
                 ok,
                 labels,
-                matchedLabels,
+                matchedLabels: labelSet.size ? labels.filter(l => labelSet.has(l)) : [],
                 featureName,
-                matchLabel,
-                matchFeature
+                matchLabel: configured.find(c => c.key === 'label')?.matched ?? null,
+                matchFeature: configured.find(c => c.key === 'feature')?.matched ?? null
               };
             }
 

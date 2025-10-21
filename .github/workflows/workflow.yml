@@ -44,7 +44,7 @@ env:
   GH_TOKEN: ${{ secrets.ORG_PROJECTS_TOKEN }}
   AUTO_ADD: ${{ github.event.inputs.auto_add }}
 
-obs:
+jobs:
   sync:
     runs-on: ubuntu-latest
     steps:

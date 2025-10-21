@@ -74,7 +74,7 @@ jobs:
             const labelSet = toSet(FILTER_LABELS);
             const featureSet = toSet(FEATURE_VALUES);
 
-            // 1) Query helper: load a ProjectV2 with all items, field defs, and needed values
+            // Query helper
             async function getProject(org, number) {
               const q = `
               query($org:String!,$number:Int!,$after:String) {
@@ -85,14 +85,12 @@ jobs:
                     fields(first:100){
                       nodes{
                         __typename
-                        ... on ProjectV2SingleSelectField {
+                        ... on ProjectV2FieldCommon {
                           id
                           name
-                          options { id name }
                         }
-                        ... on ProjectV2Field {
-                          id
-                          name
+                        ... on ProjectV2SingleSelectField {
+                          options { id name }
                         }
                       }
                     }
@@ -119,12 +117,17 @@ jobs:
                           nodes{
                             __typename
                             ... on ProjectV2ItemFieldSingleSelectValue{
-                              field{ __typename ... on ProjectV2SingleSelectField { id name } }
+                              field{
+                                __typename
+                                ... on ProjectV2FieldCommon { id name }
+                              }
                               name
-                              optionId
                             }
                             ... on ProjectV2ItemFieldDateValue{
-                              field{ id name }
+                              field{
+                                __typename
+                                ... on ProjectV2FieldCommon { id name }
+                              }
                               date
                             }
                           }
@@ -194,7 +197,7 @@ jobs:
               };
             }
 
-            // 2) Mutations
+            // Mutations
             async function addItem(projectId, contentId) {
               const m = `
               mutation($projectId:ID!,$contentId:ID!){
@@ -223,7 +226,7 @@ jobs:
               await github.graphql(m, { projectId, itemId, fieldId, value });
             }
 
-            // 3) Filter predicate (label OR single-select "機能名")
+            // Filter predicate
             function shouldSync(contentId, parent) {
               const labels = parent.labelsByContentId[contentId] || [];
               const vals = parent.valuesByContentId[contentId] || {};
@@ -232,8 +235,7 @@ jobs:
               const matchFeature = featureSet.size === 0 ? false : (vals.featureName ? featureSet.has(vals.featureName) : false);
 
               if (labelSet.size === 0 && featureSet.size === 0) {
-                // no filters configured -> do not restrict (sync all)
-                return true;
+                return true; // no filters configured -> sync all
               }
               if (FILTER_MODE === 'AND') {
                 const needLabel = labelSet.size > 0;
@@ -242,11 +244,10 @@ jobs:
                 const okFeature = needFeature ? matchFeature : false;
                 return okLabel && okFeature;
               }
-              // default OR
-              return matchLabel || matchFeature;
+              return matchLabel || matchFeature; // default OR
             }
 
-            // 4) Load parent
+            // Load parent
             const parent = await getProject(ORG, PARENT_NUM);
             core.info(`Parent: ${parent.title}`);
 
@@ -261,10 +262,10 @@ jobs:
             if (!parentFeatureField) {
               core.warning(`Parent field not found: ${FEATURE_FIELD_NAME}`);
             } else if (parentFeatureField.__typename !== 'ProjectV2SingleSelectField') {
-              core.warning(`Parent field "${FEATURE_FIELD_NAME}" is not Single-select (typename=${parentFeatureField.__typename}). Filtering by feature may not work.`);
+              core.warning(`Parent field "${FEATURE_FIELD_NAME}" is not Single-select (typename=${parentFeatureField.__typename}).`);
             }
 
-            // 5) For each child: sync items that pass the filter
+            // Sync to children
             for (const childNum of CHILD_NUMS) {
               const child = await getProject(ORG, childNum);
               core.info(`Child: ${child.title}`);
@@ -286,10 +287,9 @@ jobs:
               let updated = 0, skipped = 0, added = 0, filteredOut = 0;
 
               for (const [contentId, parentVals] of Object.entries(parent.valuesByContentId)) {
-                // Apply filter (labels on parent issue/PR and/or single-select "機能名" on parent)
                 if (!shouldSync(contentId, parent)) { filteredOut++; continue; }
 
-                // Ensure exists in child (or add if AUTO_ADD)
+                // Ensure exists in child
                 let childItem = child.itemByContentId[contentId];
                 if (!childItem && AUTO_ADD) {
                   const newItemId = await addItem(child.id, contentId);

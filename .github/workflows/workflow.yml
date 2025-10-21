@@ -42,7 +42,7 @@ env:
   FILTER_MODE: "OR"                  # OR（どちらか一致）/ AND（両方一致）
 
   # ログ制御
-  LOG_MODE: "filtered"               # off | filtered | matched | all
+  LOG_MODE: "all"               # off | filtered | matched | all
   LOG_LIMIT: "200"                   # ログ行数上限
 
   GH_TOKEN: ${{ secrets.ORG_PROJECTS_TOKEN }}
@@ -140,11 +140,18 @@ jobs:
                             nodes{
                               __typename
                               ... on ProjectV2ItemFieldSingleSelectValue{
-                                field{ __typename ... on ProjectV2FieldCommon { id name } }
+                                field{
+                                  __typename
+                                  ... on ProjectV2SingleSelectField { id name }
+                                }
+                                optionId
                                 name
                               }
                               ... on ProjectV2ItemFieldDateValue{
-                                field{ __typename ... on ProjectV2FieldCommon { id name } }
+                                field{
+                                  __typename
+                                  ... on ProjectV2FieldCommon { id name }
+                                }
                                 date
                               }
                             }
@@ -184,11 +191,18 @@ jobs:
                             nodes{
                               __typename
                               ... on ProjectV2ItemFieldSingleSelectValue{
-                                field{ __typename ... on ProjectV2FieldCommon { id name } }
+                                field{
+                                  __typename
+                                  ... on ProjectV2SingleSelectField { id name }
+                                }
+                                optionId
                                 name
                               }
                               ... on ProjectV2ItemFieldDateValue{
-                                field{ __typename ... on ProjectV2FieldCommon { id name } }
+                                field{
+                                  __typename
+                                  ... on ProjectV2FieldCommon { id name }
+                                }
                                 date
                               }
                             }
@@ -222,27 +236,35 @@ jobs:
               const itemByContentId = {};
               const valuesByContentId = {};
               const labelsByContentId = {};
-              const rawFieldValuesByContentId = {}; // 新規: 生のフィールド値（fieldId/fieldName/type含む）
+              const rawFieldValuesByContentId = {};
 
               for (const it of items) {
                 if (!it.content) continue;
                 const contentId = it.content.id;
                 itemByContentId[contentId] = { itemId: it.id, content: it.content };
 
-                // labels
                 labelsByContentId[contentId] = (it.content.labels?.nodes || []).map(n => n.name).filter(Boolean);
 
-                // 既存: 主要フィールドは名前ベースでも取っておく（status/date）
                 const v = {};
                 const raw = [];
                 for (const fv of it.fieldValues.nodes || []) {
                   if (fv.__typename === 'ProjectV2ItemFieldSingleSelectValue') {
-                    raw.push({ type: fv.__typename, fieldId: fv.field?.id, fieldName: fv.field?.name, name: fv.name });
+                    raw.push({
+                      type: fv.__typename,
+                      fieldId: fv.field?.id,
+                      fieldName: fv.field?.name,
+                      optionId: fv.optionId || null,
+                      name: fv.name || null
+                    });
                     const fieldName = fv.field?.name;
                     if (fieldName === FIELD_STATUS) v.statusName = fv.name || null;
-                    // 機能名はここでは確定しない（後で fieldId で特定）
                   } else if (fv.__typename === 'ProjectV2ItemFieldDateValue') {
-                    raw.push({ type: fv.__typename, fieldId: fv.field?.id, fieldName: fv.field?.name, date: fv.date });
+                    raw.push({
+                      type: fv.__typename,
+                      fieldId: fv.field?.id,
+                      fieldName: fv.field?.name,
+                      date: fv.date || null
+                    });
                     const fieldName = fv.field?.name;
                     if (fieldName === FIELD_START) v.startDate = fv.date || null;
                     if (fieldName === FIELD_END) v.endDate = fv.date || null;
@@ -263,8 +285,9 @@ jobs:
               };
             }
 
-            // 親プロジェクト取得
             core.info(`Owner=${OWNER} | Filter labels=[${FILTER_LABELS.join(", ")}], featureField="${FEATURE_FIELD_NAME}", featureValues=[${FEATURE_VALUES.join(", ")}], mode=${FILTER_MODE}, LOG_MODE=${LOG_MODE}, LOG_LIMIT=${LOG_LIMIT}`);
+
+            // 親プロジェクト取得
             const parent = await getProject(OWNER, PARENT_NUM);
             core.info(`Parent: ${parent.title}`);
 
@@ -279,40 +302,40 @@ jobs:
             if (!parentFeatureField) core.warning(`Parent field not found: ${FEATURE_FIELD_NAME}`);
 
             const FEATURE_FIELD_ID = parentFeatureField?.id || null;
+            const FEATURE_OPTIONS = (parentFeatureField?.options || []).reduce((map, o) => { map[o.id] = o.name; return map; }, {});
             core.info(`Feature field id (parent): ${FEATURE_FIELD_ID ?? 'N/A'}`);
 
-            // fieldId で機能名を取り出す
-            function getFeatureNameFromParent(contentId) {
+            function resolveFeatureNameFromParent(contentId) {
               const raw = parent.rawFieldValuesByContentId[contentId] || [];
-              // 1) ID で一致
+              // 1) fieldId で一致する single-select 値を探す
               let node = null;
               if (FEATURE_FIELD_ID) {
                 node = raw.find(r => r.type === 'ProjectV2ItemFieldSingleSelectValue' && r.fieldId === FEATURE_FIELD_ID);
               }
-              // 2) 念のため名前一致のフォールバック
+              // 2) フォールバック: 名前一致
               if (!node) {
                 node = raw.find(r => r.type === 'ProjectV2ItemFieldSingleSelectValue' && r.fieldName === FEATURE_FIELD_NAME);
               }
-              return node?.name || null;
+              if (!node) return null;
+              // 3) name が空の場合は optionId -> 親フィールドの options で解決
+              if (node.name) return node.name;
+              if (node.optionId && FEATURE_OPTIONS[node.optionId]) return FEATURE_OPTIONS[node.optionId];
+              return null;
             }
 
-            // フィルタ評価（設定済みフィルタのみ対象）＋詳細ログ
+            // 評価＋詳細ログ（設定済みフィルタのみ）
             function evaluateSync(contentId) {
               const labels = parent.labelsByContentId[contentId] || [];
-              const featureName = getFeatureNameFromParent(contentId);
+              const featureName = resolveFeatureNameFromParent(contentId);
 
               const configured = [];
               if (labelSet.size > 0) configured.push({ key: 'label', matched: labels.some(l => labelSet.has(l)) });
               if (featureSet.size > 0) configured.push({ key: 'feature', matched: !!(featureName && featureSet.has(featureName)) });
 
               let ok;
-              if (configured.length === 0) {
-                ok = true;
-              } else if (FILTER_MODE === 'AND') {
-                ok = configured.every(c => c.matched);
-              } else {
-                ok = configured.some(c => c.matched);
-              }
+              if (configured.length === 0) ok = true;
+              else if (FILTER_MODE === 'AND') ok = configured.every(c => c.matched);
+              else ok = configured.some(c => c.matched); // OR
 
               return {
                 ok,
@@ -356,7 +379,6 @@ jobs:
                   core.warning(`Child ${child.title}: Missing fields. Status:${!!childStatusField} startDate:${!!childStartField} endDate:${!!childEndField}`);
                 }
 
-                // Status オプション map
                 const childStatusOptions = {};
                 if (childStatusField?.options) {
                   for (const opt of childStatusField.options) childStatusOptions[opt.name] = opt.id;
@@ -366,12 +388,9 @@ jobs:
 
                 for (const [contentId, parentVals] of Object.entries(parent.valuesByContentId)) {
                   const evalRes = evaluateSync(contentId);
-                  if ((LOG_MODE !== 'off') && ((LOG_MODE === 'all') || (LOG_MODE === 'matched' && evalRes.ok) || (LOG_MODE === 'filtered' && !evalRes.ok))) {
-                    logDecision(contentId, evalRes);
-                  }
+                  if (canLog(evalRes.ok)) logDecision(contentId, evalRes);
                   if (!evalRes.ok) { filteredOut++; continue; }
 
-                  // 子に無ければ追加
                   let childItem = child.itemByContentId[contentId];
                   if (!childItem && AUTO_ADD) {
                     const m = `
@@ -392,7 +411,6 @@ jobs:
 
                   const itemId = childItem.itemId;
 
-                  // Status
                   if (parentVals.statusName && childStatusField) {
                     const targetOptId = childStatusOptions[parentVals.statusName];
                     if (targetOptId) {
@@ -408,7 +426,6 @@ jobs:
                       core.warning(`Child ${child.title}: Status option "${parentVals.statusName}" not found for ${itemKey(parent, contentId)}`);
                     }
                   }
-                  // startDate
                   if (parentVals.startDate && childStartField) {
                     const m = `
                     mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:ProjectV2FieldValue!){
@@ -419,7 +436,6 @@ jobs:
                     await github.graphql(m, { projectId: child.id, itemId, fieldId: childStartField.id, value: { date: parentVals.startDate } });
                     updated++;
                   }
-                  // endDate
                   if (parentVals.endDate && childEndField) {
                     const m = `
                     mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:ProjectV2FieldValue!){
